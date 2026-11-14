@@ -1,0 +1,651 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Koi Pond</title>
+<style>
+  :root { --bg: #050807; --dim: #5d6b64; --red: #e0522f; }
+  html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
+  #ascii { position: fixed; left: 0; top: 0; display: block; cursor: crosshair; }
+  .caption { position: fixed; left: 16px; bottom: 12px; pointer-events: none;
+             font: 12px/1.4 ui-monospace, Consolas, monospace; color: var(--dim); letter-spacing: .04em;
+             background: rgb(5 8 7 / .7); padding: 2px 8px; border-radius: 3px; }
+  .caption b { color: var(--red); font-weight: 400; }
+</style>
+</head>
+<body>
+<canvas id="ascii" role="img" aria-label="Koi swimming in clear jade water over a pebble floor, with lily pads and water lilies, drawn in ASCII characters with moving light patterns."></canvas>
+<div class="caption"><b>鯉の池</b> &nbsp;stir · hold still · click to feed · drag pads · space petals · c colour</div>
+<script>
+"use strict";
+// Dark to bright.
+const RAMP = " .:-=+*#%@";
+const QUERY = new URLSearchParams(location.search);
+const FONT_PX = +QUERY.get("font") || 11, LINE = 1.0, SUB_X = 3, SUB_Y = 5;   // source pixels per character cell
+const KOI_SCALE = +QUERY.get("ks") || 1;
+const BG = [5, 8, 7];
+
+const view = document.getElementById("ascii");
+const vctx = view.getContext("2d");
+const src = document.createElement("canvas");
+const g = src.getContext("2d", { willReadFrequently: true });
+const atlas = document.createElement("canvas");
+
+let W, H, S, cols, rows, cw, ch, sx, sy, dpr, atlasW, atlasH, glyphs, frameData, frame32;
+let floorLayer, koi = [], pads = [], ripples = [], pellets = [], petals = [];
+const pointer = { x: -1e4, y: -1e4, t: 0, speed: 0, still: 0, inside: false };
+const wake = { x: -1e4, y: -1e4 };
+let drag = null;
+let mono = false, rand = mulberry(11);
+
+function mulberry(a) {
+  return () => { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; };
+}
+const lerp = (a, b, t) => a + (b - a) * t;
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const R = (a, b) => a + rand() * (b - a);
+const norm = (x, y) => { const l = Math.hypot(x, y) || 1; return { x: x / l, y: y / l }; };
+const rot = (d, a) => { const c = Math.cos(a), s = Math.sin(a); return { x: d.x * c - d.y * s, y: d.x * s + d.y * c }; };
+
+// ------------------------------------------------------------------ layout
+
+// ?record&w=..&h=..&post=URL renders a scripted clip frame by frame and posts each PNG to URL.
+// font=PX and ks=SCALE (koi size) also work without record.
+const params = QUERY;
+const RECORD = params.has("record");
+
+function resize() {
+  dpr = RECORD ? 1 : Math.min(2, window.devicePixelRatio || 1);
+  W = RECORD ? +params.get("w") || 880 : Math.max(320, innerWidth);
+  H = RECORD ? +params.get("h") || 440 : Math.max(240, innerHeight);
+  S = Math.min(W, H);
+  // Every ramp glyph is drawn once at device size; frames copy its lit pixels.
+  const font = `bold ${FONT_PX * dpr}px ui-monospace, Consolas, "Courier New", monospace`;
+  const actx = atlas.getContext("2d", { willReadFrequently: true });
+  actx.font = font;
+  atlasW = Math.round(actx.measureText("M").width); atlasH = Math.round(FONT_PX * LINE * dpr);
+  atlas.width = atlasW * RAMP.length; atlas.height = atlasH;
+  actx.font = font; actx.textBaseline = "top"; actx.fillStyle = "#fff";
+  for (let i = 0; i < RAMP.length; i++) actx.fillText(RAMP[i], i * atlasW, 0);
+  const apx = actx.getImageData(0, 0, atlas.width, atlasH).data;
+  glyphs = [];
+  for (let i = 0; i < RAMP.length; i++) {
+    const at = [], al = [];
+    for (let y = 0; y < atlasH; y++) for (let x = 0; x < atlasW; x++) {
+      const a = apx[(y * atlas.width + i * atlasW + x) * 4 + 3];
+      if (a > 8) { at.push(y * 65536 + x); al.push(a / 255); }
+    }
+    glyphs.push({ at, al });
+  }
+  cw = atlasW / dpr; ch = atlasH / dpr;
+  cols = Math.ceil(W / cw); rows = Math.ceil(H / ch);
+  view.width = cols * atlasW; view.height = rows * atlasH;
+  view.style.width = cols * cw + "px"; view.style.height = rows * ch + "px";
+  frameData = vctx.createImageData(view.width, view.height);
+  frame32 = new Uint32Array(frameData.data.buffer);
+  src.width = cols * SUB_X; src.height = rows * SUB_Y;
+  sx = src.width / (cols * cw); sy = src.height / (rows * ch);
+  rand = mulberry(11);
+  floorLayer = layer(drawFloor);
+  placePads();
+  if (!koi.length) spawnKoi();
+  else for (const k of koi) { if (!inside(k.x, k.y, 0)) { k.x = W / 2; k.y = H / 2; } k.trail = []; }
+}
+
+function layer(fn) {
+  const c = document.createElement("canvas");
+  c.width = src.width; c.height = src.height;
+  const ctx = c.getContext("2d", { willReadFrequently: true });   // stay on the CPU, like the frame it is copied into
+  ctx.setTransform(sx, 0, 0, sy, 0, 0);
+  fn(ctx);
+  return c;
+}
+
+function inside(x, y, m) { return x > m && x < W - m && y > m && y < H - m; }
+function randomSpot() { return { x: R(W * 0.12, W * 0.88), y: R(H * 0.12, H * 0.88) }; }
+// Spread the starting koi across a grid of cells so they do not begin in a clump.
+function startSpot(i, n) {
+  const gc = Math.ceil(Math.sqrt(n * W / H)), gr = Math.ceil(n / gc);
+  return { x: ((i % gc) + R(0.3, 0.7)) / gc * W, y: (Math.floor(i / gc) + R(0.3, 0.7)) / gr * H };
+}
+
+// ------------------------------------------------------------------ pond floor
+
+function drawFloor(ctx) {
+  ctx.fillStyle = "#56756c"; ctx.fillRect(0, 0, W, H);
+  // Rounded pebbles, packed loosely.
+  const n = Math.round(W * H / (S * S * 0.0016));
+  for (let i = 0; i < n; i++) {
+    const x = R(-20, W + 20), y = R(-20, H + 20), r = S * R(0.022, 0.05), e = R(0.6, 0.95);
+    const gr = ctx.createRadialGradient(x - r * 0.3, y - r * 0.35, r * 0.1, x, y, r);
+    const v = R(0.9, 1.08);
+    gr.addColorStop(0, `rgb(${150 * v},${182 * v},${168 * v})`);
+    gr.addColorStop(0.8, `rgb(${122 * v},${154 * v},${142 * v})`);
+    gr.addColorStop(1, `rgb(${84 * v},${110 * v},${102 * v})`);
+    ctx.fillStyle = gr; ctx.beginPath(); ctx.ellipse(x, y, r, r * e, R(0, 3.14), 0, 7); ctx.fill();
+  }
+  // Dark weed and silt patches, heavier on the right.
+  ctx.filter = `blur(${Math.max(1, S * 0.012 * sx)}px)`;
+  for (let i = 0; i < 46; i++) {
+    const cx = W * (rand() < 0.65 ? R(0.45, 1.05) : R(-0.05, 0.5)), cy = R(-0.05, 1.05) * H;
+    for (let j = 0; j < 7; j++) {
+      ctx.fillStyle = `rgba(${R(28, 44)},${R(42, 56)},${R(40, 50)},${R(0.25, 0.5)})`;
+      ctx.beginPath(); ctx.ellipse(cx + R(-1, 1) * S * 0.07, cy + R(-1, 1) * S * 0.06, S * R(0.03, 0.08), S * R(0.02, 0.05), R(0, 3), 0, 7); ctx.fill();
+    }
+  }
+  ctx.filter = "none";
+  // Jade water over everything.
+  ctx.fillStyle = "rgba(118,168,150,0.28)"; ctx.fillRect(0, 0, W, H);
+}
+
+// ------------------------------------------------------------------ lily pads
+
+function placePads() {
+  pads = [
+    { fx: 0.14, fy: 0.10, r: 0.13, hue: "green", flower: false },
+    { fx: 0.27, fy: 0.07, r: 0.12, hue: "pale", flower: false },
+    { fx: 0.08, fy: 0.24, r: 0.11, hue: "rust", flower: false },
+    { fx: 0.17, fy: 0.27, r: 0.12, hue: "olive", flower: true },
+    { fx: 0.82, fy: 0.84, r: 0.14, hue: "olive", flower: true },
+    { fx: 0.95, fy: 0.36, r: 0.09, hue: "green", flower: false },
+  ].map((p, i) => ({ ...p, a: R(0, 6.28), ph: i * 1.7 }));
+}
+
+const PAD_COLOURS = {
+  green: ["#b9c77a", "#8ea253", "#5f7a37"], pale: ["#c9cf8c", "#a7b56b", "#7c8f48"],
+  rust:  ["#c0a073", "#9b7a52", "#6e5838"], olive: ["#9cab62", "#72863f", "#4d6229"],
+};
+
+function padPos(p, t) {
+  return { x: p.fx * W + Math.sin(t * 0.07 + p.ph) * S * 0.012, y: p.fy * H + Math.cos(t * 0.05 + p.ph) * S * 0.01,
+           r: p.r * S, a: p.a + Math.sin(t * 0.04 + p.ph) * 0.15 };
+}
+
+function drawPadShadows(ctx, t) {
+  // Two stacked fills give the shadow a soft edge without a per-frame blur.
+  ctx.fillStyle = "rgba(20,32,28,0.28)";
+  for (const p of pads) {
+    const q = padPos(p, t);
+    for (const f of [1.04, 0.96]) { ctx.beginPath(); ctx.arc(q.x - q.r * 0.3, q.y + q.r * 0.28, q.r * f, 0, 7); ctx.fill(); }
+  }
+}
+
+function drawPads(ctx, t) {
+  for (const p of pads) {
+    const q = padPos(p, t), [hi, mid, lo] = PAD_COLOURS[p.hue];
+    const gr = ctx.createRadialGradient(q.x - q.r * 0.2, q.y - q.r * 0.25, q.r * 0.05, q.x, q.y, q.r);
+    gr.addColorStop(0, hi); gr.addColorStop(0.7, mid); gr.addColorStop(1, lo);
+    ctx.fillStyle = gr; ctx.beginPath(); ctx.moveTo(q.x, q.y);
+    ctx.arc(q.x, q.y, q.r, q.a + 0.08, q.a + Math.PI * 2 - 0.08); ctx.closePath(); ctx.fill();
+    ctx.strokeStyle = "rgba(60,74,30,0.45)"; ctx.lineWidth = Math.max(0.6, q.r * 0.012);
+    for (let i = 1; i < 18; i++) {
+      const a = q.a + 0.08 + i / 18 * (Math.PI * 2 - 0.16);
+      ctx.beginPath(); ctx.moveTo(q.x, q.y);
+      ctx.quadraticCurveTo(q.x + Math.cos(a + 0.08) * q.r * 0.5, q.y + Math.sin(a + 0.08) * q.r * 0.5, q.x + Math.cos(a) * q.r * 0.96, q.y + Math.sin(a) * q.r * 0.96);
+      ctx.stroke();
+    }
+    ctx.strokeStyle = lo; ctx.lineWidth = q.r * 0.03;
+    ctx.beginPath(); ctx.arc(q.x, q.y, q.r * 0.985, q.a + 0.08, q.a + Math.PI * 2 - 0.08); ctx.stroke();
+    if (p.flower) drawLily(ctx, q.x + Math.cos(q.a + Math.PI) * q.r * 0.15, q.y + Math.sin(q.a + Math.PI) * q.r * 0.15, q.r * 0.48, q.a);
+  }
+}
+
+function petal(ctx, x, y, a, len, wid, c1, c2) {
+  const d = { x: Math.cos(a), y: Math.sin(a) }, n = { x: -d.y, y: d.x };
+  const tip = { x: x + d.x * len, y: y + d.y * len };
+  const gr = ctx.createLinearGradient(x, y, tip.x, tip.y);
+  gr.addColorStop(0, c2); gr.addColorStop(1, c1);
+  ctx.fillStyle = gr; ctx.beginPath(); ctx.moveTo(x, y);
+  ctx.quadraticCurveTo(x + d.x * len * 0.5 + n.x * wid, y + d.y * len * 0.5 + n.y * wid, tip.x, tip.y);
+  ctx.quadraticCurveTo(x + d.x * len * 0.5 - n.x * wid, y + d.y * len * 0.5 - n.y * wid, x, y);
+  ctx.fill();
+}
+
+function drawLily(ctx, x, y, r, a0) {
+  ctx.fillStyle = "rgba(30,40,20,0.35)"; ctx.beginPath(); ctx.arc(x + r * 0.08, y + r * 0.12, r * 0.95, 0, 7); ctx.fill();
+  for (let i = 0; i < 11; i++) petal(ctx, x, y, a0 + i / 11 * Math.PI * 2, r, r * 0.26, "#f4efe2", "#d9d2bd");
+  for (let i = 0; i < 9; i++) petal(ctx, x, y, a0 + 0.3 + i / 9 * Math.PI * 2, r * 0.72, r * 0.2, "#fffdf6", "#efe6cf");
+  const gr = ctx.createRadialGradient(x, y, 0, x, y, r * 0.28);
+  gr.addColorStop(0, "#f7a21b"); gr.addColorStop(0.7, "#f4c23a"); gr.addColorStop(1, "#e8d27a");
+  ctx.fillStyle = gr; ctx.beginPath(); ctx.arc(x, y, r * 0.28, 0, 7); ctx.fill();
+}
+
+// ------------------------------------------------------------------ koi
+
+// base, patches [colour, count, min size, max size], fin colour
+const VARIETIES = [
+  { name: "kohaku",  base: "#f4efe6", patches: [["#e0441f", 4, 0.1, 0.2]], fin: "#f2eee6" },
+  { name: "ogon",    base: "#eaa13a", patches: [["#5b3b1c", 5, 0.02, 0.05]], fin: "#f2c27a" },
+  { name: "sanke",   base: "#f4efe6", patches: [["#e0441f", 3, 0.09, 0.17], ["#1d1c1f", 7, 0.02, 0.05]], fin: "#f2eee6" },
+  { name: "kohaku2", base: "#f6f1e8", patches: [["#ea5a26", 5, 0.08, 0.16]], fin: "#f6f1e8" },
+  { name: "showa",   base: "#f4efe6", patches: [["#e0441f", 3, 0.1, 0.18], ["#1d1c1f", 4, 0.05, 0.1]], fin: "#e9e6e0" },
+  { name: "tancho",  base: "#f7f3ea", patches: [], fin: "#f7f3ea" },
+  { name: "orenji",  base: "#ee7a2a", patches: [["#f8efe0", 2, 0.08, 0.14]], fin: "#f39a55" },
+];
+
+function spawnKoi() {
+  const n = clamp(Math.round(W * H / 140000), 5, 8);
+  for (let i = 0; i < n; i++) {
+    const v = VARIETIES[i % VARIETIES.length], p = startSpot(i, n);
+    const patches = [];
+    for (const [c, count, a, b] of v.patches)
+      for (let j = 0; j < count; j++)
+        patches.push({ s: R(0.1, 0.75), lat: R(-0.7, 0.7), rs: R(a, b), rl: R(0.4, 1.1) * (b > 0.08 ? 1 : 0.5), c });
+    if (v.name === "tancho") patches.push({ s: 0.11, lat: 0, rs: 0.055, rl: 0.6, c: "#d93a1f" });
+    koi.push({ ...v, patches, L: S * R(0.26, 0.38) * KOI_SCALE, x: p.x, y: p.y, a: R(0, 6.28), v: 10, trail: [],
+               mood: ["cruise", "cruise", "rest", "cruise", "glide"][i % 5], target: randomSpot(),
+               phase: R(0, 6.28), flap: R(0, 6.28), depth: R(0.1, 0.4), gulp: 0, retarget: R(4, 10),
+               curious: i % 3 !== 2, scared: 0, flee: 0 });
+  }
+}
+
+const MOODS = { cruise: [34, 0.9], glide: [20, 0.6], rest: [7, 0.5] };
+
+function stepKoi(k, dt) {
+  const [speed0, turn] = MOODS[k.mood];
+  let speed = speed0 * S / 800, tx = k.target.x, ty = k.target.y, hungry = false;
+  if (pellets.length) {
+    let best = null, bd = 1e9;
+    for (const p of pellets) { const d = Math.hypot(p.x - k.x, p.y - k.y); if (d < bd) { bd = d; best = p; } }
+    if (bd < S * 0.6) {
+      hungry = true; tx = best.x; ty = best.y; speed = Math.max(speed, 60 * S / 800);
+      if (bd < k.L * 0.06) { pellets.splice(pellets.indexOf(best), 1); k.gulp = 0.5; ripple(best.x, best.y, k.L * 0.3); }
+    }
+  }
+  // The cursor: a fast stir nearby startles a koi; a still hand draws the curious ones in.
+  const pd = Math.hypot(pointer.x - k.x, pointer.y - k.y);
+  let turnRate = turn, curious = false;
+  if (pointer.inside && pointer.speed > S * 1.1 && pd < k.L * 1.4 && k.scared <= 0) {
+    k.scared = R(0.9, 1.5);
+    k.flee = Math.atan2(k.y - pointer.y, k.x - pointer.x) + R(-0.5, 0.5);
+    k.depth = Math.min(0.6, k.depth + 0.25);
+  }
+  if (!hungry && k.scared <= 0 && k.curious && pointer.inside && pointer.still > 0.8 && pd < S * 0.45) {
+    curious = true; tx = pointer.x; ty = pointer.y;
+    speed = pd < k.L * 0.3 ? 2 * S / 800 : 26 * S / 800;
+    if (pd < k.L * 0.3 && rand() < dt * 0.9) { k.gulp = 0.4; ripple(k.x, k.y, k.L * 0.18, 0.6); }
+  }
+  k.depth = lerp(k.depth, hungry || curious ? 0 : k.mood === "rest" ? 0.45 : 0.2, dt * 0.4);
+  k.retarget -= dt;
+  if (!hungry && !curious && (Math.hypot(tx - k.x, ty - k.y) < k.L * 0.3 || k.retarget < 0)) { k.target = randomSpot(); k.retarget = R(5, 14); }
+  const look = k.L * 0.6;
+  let want = Math.atan2(ty - k.y, tx - k.x);
+  if (k.scared > 0) { k.scared -= dt; want = k.flee; speed = 170 * S / 800; turnRate = turn * 4; }
+  if (!inside(k.x + Math.cos(k.a) * look, k.y + Math.sin(k.a) * look, S * 0.02)) { want = Math.atan2(H / 2 - k.y, W / 2 - k.x); k.flee = want; }
+  const diff = ((want - k.a + Math.PI * 3) % (Math.PI * 2)) - Math.PI;
+  k.a += clamp(diff, -turnRate * dt, turnRate * dt);
+  k.v = lerp(k.v, speed, dt * (k.scared > 0 ? 5 : 1.2));
+  k.x += Math.cos(k.a) * k.v * dt; k.y += Math.sin(k.a) * k.v * dt;
+  const last = k.trail[0];
+  if (!last || Math.hypot(last.x - k.x, last.y - k.y) > 1.2) { k.trail.unshift({ x: k.x, y: k.y }); if (k.trail.length > 600) k.trail.pop(); }
+  k.phase += dt * (1.4 + k.v * 0.08);
+  k.flap += dt * (0.9 + k.v * 0.02);
+  k.gulp = Math.max(0, k.gulp - dt);
+}
+
+// Spine from the head back along the path actually swum, so turns bend the body.
+function spine(k, n = 30) {
+  const pts = [];
+  let idx = 0, acc = 0, prev = { x: k.x, y: k.y };
+  for (let i = 0; i <= n; i++) {
+    const want = i / n * k.L;
+    while (idx < k.trail.length) {
+      const d = Math.hypot(k.trail[idx].x - prev.x, k.trail[idx].y - prev.y);
+      if (acc + d >= want) break;
+      acc += d; prev = k.trail[idx]; idx++;
+    }
+    let p;
+    if (idx < k.trail.length) {
+      const q = k.trail[idx], seg = Math.hypot(q.x - prev.x, q.y - prev.y) || 1, f = (want - acc) / seg;
+      p = { x: lerp(prev.x, q.x, f), y: lerp(prev.y, q.y, f) };
+    } else if (pts.length > 1) {
+      const a = pts[pts.length - 2], b = pts[pts.length - 1], d = norm(b.x - a.x, b.y - a.y);
+      p = { x: b.x + d.x * k.L / n, y: b.y + d.y * k.L / n };
+    } else if (pts.length === 1) {
+      p = { x: pts[0].x - Math.cos(k.a) * k.L / n, y: pts[0].y - Math.sin(k.a) * k.L / n };
+    } else p = { x: k.x, y: k.y };
+    pts.push(p);
+  }
+  for (let i = 0; i <= n; i++) {
+    const a = pts[Math.max(0, i - 1)], b = pts[Math.min(n, i + 1)], d = norm(a.x - b.x, a.y - b.y);   // d points toward the head
+    Object.assign(pts[i], { dx: d.x, dy: d.y, nx: -d.y, ny: d.x });
+  }
+  const amp = k.L * (0.03 + Math.min(0.04, k.v * 0.0005));
+  for (let i = 0; i <= n; i++) {
+    const s = i / n, off = amp * Math.sin(s * 5.2 - k.phase) * Math.pow(s, 1.5);
+    pts[i].x += pts[i].nx * off; pts[i].y += pts[i].ny * off; pts[i].s = s;
+  }
+  return pts;
+}
+
+function halfWidth(k, s) {
+  const hw = k.L * 0.14;
+  if (s < 0.14) return hw * (0.48 + 0.52 * Math.sin(s / 0.14 * Math.PI / 2));
+  if (s < 0.42) return hw * (1 - 0.04 * Math.abs(s - 0.3) / 0.16);
+  return hw * (1 - 0.86 * Math.pow((s - 0.42) / 0.58, 1.25));
+}
+
+function bodyPath(ctx, k, pts, ox = 0, oy = 0) {
+  ctx.beginPath();
+  const h = pts[0], w0 = halfWidth(k, 0);
+  for (let j = 0; j <= 8; j++) {          // rounded snout
+    const a = Math.PI / 2 - j / 8 * Math.PI;
+    const x = h.x + h.dx * Math.cos(a) * w0 * 0.9 + h.nx * Math.sin(a) * w0;
+    const y = h.y + h.dy * Math.cos(a) * w0 * 0.9 + h.ny * Math.sin(a) * w0;
+    j ? ctx.lineTo(x + ox, y + oy) : ctx.moveTo(x + ox, y + oy);
+  }
+  for (let i = 0; i < pts.length; i++) { const p = pts[i], w = halfWidth(k, p.s); ctx.lineTo(p.x - p.nx * w + ox, p.y - p.ny * w + oy); }
+  for (let i = pts.length - 1; i >= 0; i--) { const p = pts[i], w = halfWidth(k, p.s); ctx.lineTo(p.x + p.nx * w + ox, p.y + p.ny * w + oy); }
+  ctx.closePath();
+}
+
+// A soft fin: a fan from the root, with rays.
+function fin(ctx, root, dir, len, wid, colour, alpha, curl = 0) {
+  const side = { x: -dir.y, y: dir.x };
+  const tip = { x: root.x + dir.x * len + side.x * curl, y: root.y + dir.y * len + side.y * curl };
+  ctx.globalAlpha = alpha; ctx.fillStyle = colour; ctx.beginPath();
+  ctx.moveTo(root.x - side.x * wid * 0.25, root.y - side.y * wid * 0.25);
+  ctx.bezierCurveTo(root.x + dir.x * len * 0.4 - side.x * wid, root.y + dir.y * len * 0.4 - side.y * wid,
+                    tip.x - side.x * wid * 0.8, tip.y - side.y * wid * 0.8, tip.x, tip.y);
+  ctx.bezierCurveTo(tip.x + side.x * wid * 0.6, tip.y + side.y * wid * 0.6,
+                    root.x + dir.x * len * 0.4 + side.x * wid * 0.7, root.y + dir.y * len * 0.4 + side.y * wid * 0.7,
+                    root.x + side.x * wid * 0.25, root.y + side.y * wid * 0.25);
+  ctx.fill();
+  ctx.globalAlpha = alpha * 0.6; ctx.strokeStyle = "#ffffff"; ctx.lineWidth = Math.max(0.5, len * 0.012);
+  for (let i = -2; i <= 2; i++) {
+    ctx.beginPath(); ctx.moveTo(root.x, root.y);
+    ctx.quadraticCurveTo(root.x + dir.x * len * 0.5 + side.x * wid * 0.25 * i, root.y + dir.y * len * 0.5 + side.y * wid * 0.25 * i,
+                         tip.x + side.x * wid * 0.45 * i - dir.x * len * 0.1 * Math.abs(i), tip.y + side.y * wid * 0.45 * i - dir.y * len * 0.1 * Math.abs(i));
+    ctx.stroke();
+  }
+}
+
+function drawFins(ctx, k, pts, alpha, colour) {
+  for (const side of [-1, 1]) {
+    const p = pts[6], w = halfWidth(k, p.s), back = { x: -p.dx, y: -p.dy };
+    const open = 0.95 + 0.3 * Math.sin(k.flap + (side > 0 ? 0 : 1.4));
+    fin(ctx, { x: p.x + p.nx * w * side * 0.75, y: p.y + p.ny * w * side * 0.75 }, rot(back, side * open), k.L * 0.21, k.L * 0.09, colour, alpha, side * k.L * 0.03);
+    const q = pts[15], wq = halfWidth(k, q.s);
+    fin(ctx, { x: q.x + q.nx * wq * side * 0.6, y: q.y + q.ny * wq * side * 0.6 }, rot({ x: -q.dx, y: -q.dy }, side * 0.75), k.L * 0.1, k.L * 0.04, colour, alpha);
+  }
+  const tl = pts[pts.length - 1], tb = { x: -tl.dx, y: -tl.dy };
+  const spread = 0.32 + 0.1 * Math.sin(k.phase * 0.5), sway = 0.3 * Math.sin(k.phase - 1.4);
+  for (const side of [-1, 1])
+    fin(ctx, tl, rot(tb, side * spread + sway), k.L * 0.3, k.L * 0.11, colour, alpha, -side * k.L * 0.04);
+}
+
+function drawKoiShadow(ctx, k, pts) {
+  const off = k.L * (0.16 + (0.5 - k.depth) * 0.15);
+  ctx.save(); ctx.translate(-off * 0.45, off);
+  drawFins(ctx, k, pts, 0.3, "#14201c");
+  ctx.globalAlpha = 0.3; ctx.fillStyle = "#14201c";
+  bodyPath(ctx, k, pts); ctx.fill();
+  ctx.translate(k.L * 0.012, -k.L * 0.012); bodyPath(ctx, k, pts); ctx.fill();
+  ctx.restore(); ctx.globalAlpha = 1;
+}
+
+function drawKoi(ctx, k, t, pts) {
+  const alpha = 1 - k.depth * 0.45;
+  drawFins(ctx, k, pts, alpha * 0.38, k.fin);
+  ctx.globalAlpha = alpha;
+  bodyPath(ctx, k, pts); ctx.fillStyle = k.base; ctx.fill();
+  ctx.save(); bodyPath(ctx, k, pts); ctx.clip();
+  for (const pc of k.patches) {
+    const p = pts[Math.round(pc.s * (pts.length - 1))], w = halfWidth(k, p.s);
+    ctx.fillStyle = pc.c; ctx.beginPath();
+    ctx.ellipse(p.x + p.nx * w * pc.lat, p.y + p.ny * w * pc.lat, pc.rs * k.L, w * pc.rl, Math.atan2(p.dy, p.dx), 0, 7);
+    ctx.fill();
+  }
+  // Rounded shading: dark flanks, a bright back.
+  ctx.globalAlpha = alpha * 0.3; ctx.strokeStyle = "#0e1512";
+  for (const w of [0.1, 0.05]) { ctx.lineWidth = k.L * w; bodyPath(ctx, k, pts); ctx.stroke(); }
+  ctx.strokeStyle = "#ffffff"; ctx.lineCap = "round";
+  for (const w of [0.07, 0.035]) {
+    ctx.globalAlpha = alpha * 0.3; ctx.lineWidth = k.L * w;
+    ctx.beginPath(); pts.slice(2, 20).forEach((p, i) => i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y)); ctx.stroke();
+  }
+  ctx.restore();
+  // Head: eyes and a mouth that opens to gulp.
+  ctx.globalAlpha = alpha;
+  const e = pts[2], ew = halfWidth(k, e.s) * 0.68;
+  ctx.fillStyle = "#101010";
+  for (const side of [-1, 1]) { ctx.beginPath(); ctx.arc(e.x + e.nx * ew * side, e.y + e.ny * ew * side, k.L * 0.012 + 0.5, 0, 7); ctx.fill(); }
+  if (k.gulp > 0) { ctx.fillStyle = "#3a1a14"; ctx.beginPath(); ctx.arc(pts[0].x + pts[0].dx * k.L * 0.02, pts[0].y + pts[0].dy * k.L * 0.02, k.L * 0.025, 0, 7); ctx.fill(); }
+  ctx.globalAlpha = 1;
+}
+
+// ------------------------------------------------------------------ surface
+
+// strength scales both the drawn ring and how far it bends the scene below.
+function ripple(x, y, max, strength = 1) {
+  if (ripples.length > 60) ripples.shift();
+  ripples.push({ x, y, r: 2, max, strength });
+}
+
+function drawSurface(ctx) {
+  ctx.lineWidth = Math.max(1, S * 0.003);
+  for (const r of ripples) {
+    const f = (1 - r.r / r.max) * r.strength;
+    ctx.strokeStyle = `rgba(235,255,245,${0.5 * f})`; ctx.beginPath(); ctx.arc(r.x, r.y, r.r, 0, 7); ctx.stroke();
+    ctx.strokeStyle = `rgba(235,255,245,${0.25 * f})`; ctx.beginPath(); ctx.arc(r.x, r.y, r.r * 0.65, 0, 7); ctx.stroke();
+  }
+  for (const p of pellets) { ctx.fillStyle = "#b9824a"; ctx.beginPath(); ctx.arc(p.x, p.y, S * 0.004, 0, 7); ctx.fill(); }
+}
+
+// Sakura petals resting on the surface; a stir pushes them aside.
+function dropPetals(n, x, y) {
+  for (let i = 0; i < n; i++) {
+    const px = x ?? R(0, W), py = y ?? R(0, H);
+    petals.push({ x: px + (x == null ? 0 : R(-1, 1) * S * 0.08), y: py + (y == null ? 0 : R(-1, 1) * S * 0.08),
+                  vx: 0, vy: 0, rot: R(0, 6.28), spin: R(-0.4, 0.4), size: S * R(0.007, 0.012), life: R(40, 70),
+                  land: R(0, 0.6), tone: rand() });
+  }
+  if (petals.length > 160) petals.splice(0, petals.length - 160);
+}
+
+function stepPetals(dt) {
+  for (const p of petals) {
+    if (p.land > 0) { p.land -= dt; if (p.land <= 0) ripple(p.x, p.y, S * 0.025, 0.5); continue; }
+    const dx = p.x - pointer.x, dy = p.y - pointer.y, d = Math.hypot(dx, dy);
+    if (pointer.inside && d < S * 0.08 && pointer.speed > S * 0.2) {
+      const push = (1 - d / (S * 0.08)) * Math.min(pointer.speed, S * 3) * 0.6 * dt;
+      p.vx += dx / (d || 1) * push; p.vy += dy / (d || 1) * push;
+    }
+    p.vx += S * 0.004 * dt; p.vx *= Math.exp(-dt * 1.5); p.vy *= Math.exp(-dt * 1.5);
+    p.x += p.vx * dt; p.y += p.vy * dt; p.rot += p.spin * dt; p.life -= dt;
+  }
+  petals = petals.filter(p => p.life > 0 && p.x > -20 && p.x < W + 20 && p.y > -20 && p.y < H + 20);
+}
+
+function drawPetals(ctx) {
+  for (const p of petals) {
+    if (p.land > 0) continue;
+    ctx.globalAlpha = Math.min(1, p.life / 4);
+    ctx.fillStyle = p.tone < 0.5 ? "#f7c2d2" : "#fbe0e8";
+    ctx.beginPath(); ctx.ellipse(p.x, p.y, p.size * 1.5, p.size, p.rot, 0, 7); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
+// Moving light network on the pond floor (after Dave Hoskins' water caustic).
+function caustic(x, y, t) {
+  const TAU = 6.2832;
+  const px = ((x / 340 * TAU) % TAU) - 250, py = ((y / 340 * TAU) % TAU) - 250;
+  let ix = px, iy = py, c = 1;
+  for (let n = 0; n < 4; n++) {
+    const tt = t * (1 - 3.5 / (n + 1));
+    const nx = px + Math.cos(tt - ix) + Math.sin(tt + iy), ny = py + Math.sin(tt - iy) + Math.cos(tt + ix);
+    ix = nx; iy = ny;
+    c += 1 / Math.hypot(px / (Math.sin(ix + tt) / 0.005), py / (Math.cos(iy + tt) / 0.005));
+  }
+  c = 1.17 - Math.pow(c / 4, 1.4);
+  return Math.min(1, Math.pow(Math.abs(c), 8));
+}
+
+// ------------------------------------------------------------------ frame
+
+function step(dt) {
+  for (const k of koi) stepKoi(k, dt);
+  koi.sort((a, b) => b.depth - a.depth);
+  for (const r of ripples) r.r += dt * S * 0.07;
+  ripples = ripples.filter(r => r.r < r.max);
+  for (const p of pellets) p.life -= dt;
+  pellets = pellets.filter(p => p.life > 0);
+  stepPetals(dt);
+  pointer.speed *= Math.exp(-dt * 6);
+  pointer.still += dt;
+}
+
+function render(t) {
+  g.setTransform(1, 0, 0, 1, 0, 0);
+  g.drawImage(floorLayer, 0, 0);
+  g.setTransform(sx, 0, 0, sy, 0, 0);
+  drawPadShadows(g, t);
+  const spines = koi.map(k => spine(k));
+  koi.forEach((k, i) => drawKoiShadow(g, k, spines[i]));
+  koi.forEach((k, i) => drawKoi(g, k, t, spines[i]));
+  drawSurface(g);
+  drawPetals(g);
+  drawPads(g, t);
+
+  const data = g.getImageData(0, 0, src.width, src.height).data;
+  const sw = src.width, shh = src.height, n = RAMP.length - 1, fw = view.width, inv = 1 / (SUB_X * SUB_Y);
+  const padNow = pads.map(p => padPos(p, t));
+  frame32.fill(0xFF000000 | BG[2] << 16 | BG[1] << 8 | BG[0]);
+  const ct = t * 0.45 + 23, band = S * 0.022, bend = S * 0.018;
+  for (let r = 0; r < rows; r++) {
+    const y = (r + 0.5) * ch;
+    for (let c = 0; c < cols; c++) {
+      const x = (c + 0.5) * cw;
+      // Ripples refract: each ring shifts what is seen beneath it and brightens its crest.
+      let ox = 0, oy = 0, crest = 0;
+      for (const rp of ripples) {
+        const dx = x - rp.x, dy = y - rp.y, d2 = dx * dx + dy * dy, lo = Math.max(0, rp.r - band), hi = rp.r + band;
+        if (d2 > hi * hi || d2 < lo * lo) continue;
+        const d = Math.sqrt(d2) || 1, wv = Math.sin((d - rp.r) / band * Math.PI) * (1 - rp.r / rp.max) * rp.strength;
+        ox += dx / d * wv * bend; oy += dy / d * wv * bend; crest += wv;
+      }
+      const bx = clamp(Math.round(c * SUB_X + ox * sx), 0, sw - SUB_X), by = clamp(Math.round(r * SUB_Y + oy * sy), 0, shh - SUB_Y);
+      let rr = 0, gg = 0, bb = 0;
+      for (let yy = 0; yy < SUB_Y; yy++) {
+        let i = ((by + yy) * sw + bx) * 4;
+        for (let xx = 0; xx < SUB_X; xx++, i += 4) { rr += data[i]; gg += data[i + 1]; bb += data[i + 2]; }
+      }
+      rr *= inv; gg *= inv; bb *= inv;
+      let under = true;
+      for (const q of padNow) if ((x - q.x) ** 2 + (y - q.y) ** 2 < q.r * q.r) { under = false; break; }
+      if (under) {
+        const light = Math.min(1, caustic(x, y, ct) * 1.3) * 95 + Math.max(0, crest) * 70;
+        rr += light * 0.85; gg += light; bb += light * 0.9;
+      }
+      // Stretch so open water sits on + and *, as in a photo-to-ASCII render.
+      const L = clamp(((0.299 * rr + 0.587 * gg + 0.114 * bb) / 255 - 0.08) / 0.72, 0, 1);
+      const idx = Math.round(L * n);
+      if (idx === 0) continue;
+      let cr, cg, cb;
+      if (mono) { cr = 214; cg = 222; cb = 210; }
+      else { const boost = 1.05 + 0.6 * (1 - L); cr = Math.min(255, rr * boost); cg = Math.min(255, gg * boost); cb = Math.min(255, bb * boost); }
+      cr -= BG[0]; cg -= BG[1]; cb -= BG[2];
+      const gl = glyphs[idx], at = gl.at, al = gl.al, base = r * atlasH * fw + c * atlasW;
+      for (let j = 0; j < at.length; j++) {
+        const a = al[j], p = at[j];
+        frame32[base + (p >> 16) * fw + (p & 0xFFFF)] =
+          0xFF000000 | (BG[2] + cb * a) << 16 | (BG[1] + cg * a) << 8 | (BG[0] + cr * a);
+      }
+    }
+  }
+  vctx.putImageData(frameData, 0, 0);
+}
+
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min(0.05, (now - last) / 1000); last = now;
+  step(dt);
+  render(now / 1000);
+  requestAnimationFrame(frame);
+}
+
+// ------------------------------------------------------------------ input
+
+function padAt(x, y) {
+  const t = performance.now() / 1000;
+  for (let i = pads.length - 1; i >= 0; i--) {
+    const q = padPos(pads[i], t);
+    if (Math.hypot(x - q.x, y - q.y) < q.r) return { pad: pads[i], ox: q.x - x, oy: q.y - y };
+  }
+  return null;
+}
+
+function feed(x, y) {
+  ripple(x, y, S * 0.12, 1.2);
+  for (let i = 0; i < 7; i++) pellets.push({ x: x + R(-1, 1) * S * 0.03, y: y + R(-1, 1) * S * 0.03, life: 25 });
+}
+
+view.addEventListener("pointerdown", e => {
+  const x = e.clientX, y = e.clientY;
+  view.setPointerCapture(e.pointerId);
+  const hit = padAt(x, y);
+  if (hit) { drag = hit; view.style.cursor = "grabbing"; ripple(x, y, S * 0.06, 0.6); return; }
+  feed(x, y);
+});
+
+view.addEventListener("pointermove", e => {
+  const x = e.clientX, y = e.clientY, now = performance.now();
+  const dist = Math.hypot(x - pointer.x, y - pointer.y), dt = Math.max(1, now - pointer.t) / 1000;
+  if (pointer.inside) pointer.speed = lerp(pointer.speed, dist / dt, 0.5);
+  if (dist > 3) pointer.still = 0;
+  Object.assign(pointer, { x, y, t: now, inside: true });
+  if (drag) {
+    const p = drag.pad;
+    p.fx = clamp((x + drag.ox) / W, 0, 1); p.fy = clamp((y + drag.oy) / H, 0, 1);
+  } else {
+    view.style.cursor = padAt(x, y) ? "grab" : "crosshair";
+  }
+  // A wake of small rings behind the moving cursor.
+  if (Math.hypot(x - wake.x, y - wake.y) > S * 0.03) {
+    ripple(x, y, S * (drag ? 0.05 : 0.07), clamp(pointer.speed / (S * 2), 0.25, 0.9));
+    wake.x = x; wake.y = y;
+  }
+});
+
+function endDrag() { drag = null; view.style.cursor = "crosshair"; }
+view.addEventListener("pointerup", endDrag);
+view.addEventListener("pointercancel", endDrag);
+view.addEventListener("pointerleave", () => { pointer.inside = false; });
+
+addEventListener("keydown", e => {
+  if (e.key === "c" || e.key === "C") mono = !mono;
+  if (e.key === " ") { e.preventDefault(); dropPetals(40); }
+});
+// A fixed-step clip: petals land, a hand stirs past a koi, then food drops in.
+async function record() {
+  const fps = +params.get("fps") || 12, seconds = +params.get("s") || 9, post = params.get("post");
+  const dt = 1 / fps;
+  for (let i = 0; i < 6 * fps; i++) step(dt);          // let the koi spread out and bend first
+  const stirFrom = { x: W * 0.15, y: H * 0.7 }, stirTo = { x: W * 0.75, y: H * 0.35 };
+  for (let f = 0; f < fps * seconds; f++) {
+    const t = f * dt;
+    if (f === Math.round(0.5 * fps)) dropPetals(30);
+    if (t > 2.5 && t < 4) {
+      const u = (t - 2.5) / 1.5, x = lerp(stirFrom.x, stirTo.x, u), y = lerp(stirFrom.y, stirTo.y, u);
+      Object.assign(pointer, { x, y, inside: true, speed: S * 1.6, still: 0 });
+      ripple(x, y, S * 0.07, 0.8);
+    } else pointer.inside = false;
+    if (f === Math.round(5.5 * fps)) feed(W * 0.55, H * 0.5);
+    step(dt);
+    render(t + 10);
+    const blob = await new Promise(r => view.toBlob(r, "image/png"));
+    await fetch(`${post}/frame/${String(f).padStart(4, "0")}`, { method: "POST", body: blob });
+  }
+  await fetch(`${post}/done`, { method: "POST" });
+}
+
+addEventListener("resize", () => { if (!RECORD) resize(); });
+resize();
+if (RECORD) { document.querySelector(".caption").remove(); record(); }
+else requestAnimationFrame(frame);
+</script>
+</body>
+</html>
