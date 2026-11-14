@@ -92,7 +92,9 @@ function resize() {
   floorLayer = layer(drawFloor);
   placePads();
   if (!koi.length) spawnKoi();
-  else for (const k of koi) { if (!inside(k.x, k.y, 0)) { k.x = W / 2; k.y = H / 2; } k.trail = []; }
+  else for (const k of koi) {
+    if (!inside(k.x, k.y, 0)) { k.x = W / 2; k.y = H / 2; seedTrail(k); }   // keep the swum path unless the koi had to move
+  }
 }
 
 function layer(fn) {
@@ -235,11 +237,23 @@ function spawnKoi() {
       for (let j = 0; j < count; j++)
         patches.push({ s: R(0.1, 0.75), lat: R(-0.7, 0.7), rs: R(a, b), rl: R(0.4, 1.1) * (b > 0.08 ? 1 : 0.5), c });
     if (v.name === "tancho") patches.push({ s: 0.11, lat: 0, rs: 0.055, rl: 0.6, c: "#d93a1f" });
-    koi.push({ ...v, patches, L: S * R(0.26, 0.38) * KOI_SCALE, x: p.x, y: p.y, a: R(0, 6.28), v: 10, trail: [],
-               mood: ["cruise", "cruise", "rest", "cruise", "glide"][i % 5], target: randomSpot(),
-               phase: R(0, 6.28), flap: R(0, 6.28), depth: R(0.1, 0.4), gulp: 0, retarget: R(4, 10),
-               curious: i % 3 !== 2, scared: 0, flee: 0 });
+    const target = randomSpot();
+    const k = { ...v, patches, L: S * R(0.26, 0.38) * KOI_SCALE, x: p.x, y: p.y, a: Math.atan2(target.y - p.y, target.x - p.x),
+                v: 10, trail: [], mood: ["cruise", "cruise", "rest", "cruise", "glide"][i % 5], target,
+                phase: R(0, 6.28), flap: R(0, 6.28), depth: R(0.1, 0.4), gulp: 0, retarget: R(4, 10),
+                curious: i % 3 !== 2, scared: 0, flee: 0 };
+    seedTrail(k);
+    koi.push(k);
   }
+}
+
+// The body is laid along the path already swum. A new koi has none, so give it a straight
+// path behind it, longer than the body: otherwise most of the body is extended off a short,
+// still-bending path and swings around wildly for the first seconds.
+function seedTrail(k) {
+  k.trail = [];
+  for (let d = 1.5; d < k.L * 1.3; d += 1.5)
+    k.trail.push({ x: k.x - Math.cos(k.a) * d, y: k.y - Math.sin(k.a) * d });
 }
 
 const MOODS = { cruise: [34, 0.9], glide: [20, 0.6], rest: [7, 0.5] };
